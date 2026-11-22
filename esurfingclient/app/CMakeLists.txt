@@ -192,6 +192,30 @@ else ()
                 m
         )
     endif ()
+
+    # libcurl is linked statically here (CURL_STATICLIB / CURL_USE_STATIC_LIBS),
+    # but CMake's FindCURL only hands out CURL::libcurl and never propagates the
+    # private dependencies recorded in libcurl.pc. A libcurl built with HTTP2,
+    # TLS and zlib support therefore links fine on its own yet leaves
+    # nghttp2_*, SSL_*/EVP_* and inflate_* unresolved in the final binary.
+    # Probe each optional backend and link it only when present, so builds
+    # against a stripped-down libcurl (such as the one used by the packaging
+    # CI) stay working.
+    find_package(OpenSSL QUIET)
+    if (OPENSSL_FOUND)
+        target_link_libraries(ESurfingClient PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif ()
+
+    find_package(ZLIB QUIET)
+    if (ZLIB_FOUND)
+        target_link_libraries(ESurfingClient PRIVATE ZLIB::ZLIB)
+    endif ()
+
+    find_library(NGHTTP2_LIBRARY NAMES nghttp2)
+    if (NGHTTP2_LIBRARY)
+        target_link_libraries(ESurfingClient PRIVATE ${NGHTTP2_LIBRARY})
+    endif ()
+endif ()
 endif ()
 
 target_compile_options(ESurfingClient PRIVATE -Os)
