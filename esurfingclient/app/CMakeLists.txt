@@ -216,7 +216,6 @@ else ()
         target_link_libraries(ESurfingClient PRIVATE ${NGHTTP2_LIBRARY})
     endif ()
 endif ()
-endif ()
 
 target_compile_options(ESurfingClient PRIVATE -Os)
 
