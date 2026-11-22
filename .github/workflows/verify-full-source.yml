@@ -272,15 +272,36 @@ jobs:
           # 注意：`make package/X/compile` 只编译不打包，产物停在
           # build_dir，不会出现在 bin/packages 下。要得到 .apk 必须再跑
           # `make package/X/install`（它会把包写进 bin/packages）。
-          echo "=== make package/esurfingclient/install ==="
-          make package/esurfingclient/install V=s 2>&1 | tail -30
-          echo "  exit=$?"
-          echo ""
-          echo "=== 查找产物 ==="
-          find bin -name "esurfingclient*" -type f 2>/dev/null | head -10
-          echo ""
-          echo "=== bin 目录结构 ==="
-          ls -R bin/packages 2>/dev/null | head -20 || echo "(无 bin/packages)"
+          echo "=== 尝试两种 install 目标 ===" | tee -a /tmp/build.log
+          # OpenWrt 的 install 目标按子包区分：
+          #   package/<目录>/<子包>/install
+          # 目录名与子包名同为 esurfingclient 时，正确目标是
+          #   package/esurfingclient/esurfingclient/install
+          # 只写 package/esurfingclient/install 可能匹配不到具体子包。
+          for tgt in \
+            "package/esurfingclient/esurfingclient/install" \
+            "package/esurfingclient/install"
+          do
+            echo "--- make $tgt ---" | tee -a /tmp/build.log
+            make "$tgt" V=s 2>&1 | tee -a /tmp/build.log | tail -15
+            echo "  exit=${PIPESTATUS[0]}" | tee -a /tmp/build.log
+            if ls bin/packages/*/*/esurfingclient*.apk >/dev/null 2>&1; then
+              echo "  ✅ 已生成 apk，停止尝试" | tee -a /tmp/build.log
+              break
+            fi
+          done
+
+          echo "" | tee -a /tmp/build.log
+          echo "=== 查找产物 ===" | tee -a /tmp/build.log
+          find bin -name "esurfingclient*" -type f 2>/dev/null | tee -a /tmp/build.log | head -10
+          echo "" | tee -a /tmp/build.log
+          echo "=== bin/packages 结构 ===" | tee -a /tmp/build.log
+          ls -R bin/packages 2>/dev/null | head -25 | tee -a /tmp/build.log || echo "(无 bin/packages)" | tee -a /tmp/build.log
+
+          # 若依旧没有产物，直接手工确认 build_dir 里的 ipkg 目录
+          echo "" | tee -a /tmp/build.log
+          echo "=== build_dir 里的包目录 ===" | tee -a /tmp/build.log
+          ls -la build_dir/target-*/esurfingclient/ipkg-*/ 2>/dev/null | head -15 | tee -a /tmp/build.log || echo "(无)" | tee -a /tmp/build.log
 
       - name: 收集产物
         id: collect
