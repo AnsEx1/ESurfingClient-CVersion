@@ -192,6 +192,93 @@ else ()
                 m
         )
     endif ()
+    # ------------------------------------------------------------------
+    # Handle libcurl static-link transitive dependencies.
+    #
+    # CMake's FindCURL only exposes CURL::libcurl and never propagates
+    # the Libs.private entries from libcurl.pc. When the host libcurl is
+    # built with HTTP2 / TLS / zlib support, a static link leaves
+    # nghttp2_* / SSL_* / inflate_* unresolved.
+    #
+    # Strategy: probe each backend. Use .a when present; when only a
+    # shared object exists, mark it dynamic; when the backend is absent
+    # (the trimmed libcurl used by the packaging CI), skip it entirely
+    # so the original behaviour is preserved.
+    # ------------------------------------------------------------------
+
+    set(_ES_DYNAMIC_BACKENDS "")
+    set(_ES_WANT_STATIC FALSE)
+    if (CMAKE_EXE_LINKER_FLAGS MATCHES "-static")
+        set(_ES_WANT_STATIC TRUE)
+    endif ()
+
+    # ---- OpenSSL ----
+    find_package(OpenSSL QUIET)
+    if (OPENSSL_FOUND)
+        set(_ES_SSL_A "")
+        set(_ES_CRYPTO_A "")
+        if (_ES_WANT_STATIC)
+            find_library(_ES_SSL_A NAMES libssl.a)
+            find_library(_ES_CRYPTO_A NAMES libcrypto.a)
+        endif ()
+        if (_ES_SSL_A AND _ES_CRYPTO_A)
+            target_link_libraries(ESurfingClient PRIVATE ${_ES_CRYPTO_A} ${_ES_SSL_A})
+            message(STATUS "ESurfingClient: OpenSSL static")
+        else ()
+            target_link_libraries(ESurfingClient PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            if (_ES_WANT_STATIC)
+                list(APPEND _ES_DYNAMIC_BACKENDS "OpenSSL")
+            endif ()
+            message(STATUS "ESurfingClient: OpenSSL dynamic")
+        endif ()
+    endif ()
+
+    # ---- zlib ----
+    find_package(ZLIB QUIET)
+    if (ZLIB_FOUND)
+        set(_ES_Z_A "")
+        if (_ES_WANT_STATIC)
+            find_library(_ES_Z_A NAMES libz.a)
+        endif ()
+        if (_ES_Z_A)
+            target_link_libraries(ESurfingClient PRIVATE ${_ES_Z_A})
+            message(STATUS "ESurfingClient: zlib static")
+        else ()
+            target_link_libraries(ESurfingClient PRIVATE ZLIB::ZLIB)
+            if (_ES_WANT_STATIC)
+                list(APPEND _ES_DYNAMIC_BACKENDS "zlib")
+            endif ()
+            message(STATUS "ESurfingClient: zlib dynamic")
+        endif ()
+    endif ()
+
+    # ---- nghttp2 ----
+    # Must ask for libnghttp2.a explicitly: a bare find_library(nghttp2)
+    # returns the .so and then -static fails with
+    # "attempted static link of dynamic object".
+    find_library(_ES_NGHTTP2_A NAMES libnghttp2.a)
+    find_library(_ES_NGHTTP2_SO NAMES nghttp2)
+    if (_ES_NGHTTP2_A)
+        target_link_libraries(ESurfingClient PRIVATE ${_ES_NGHTTP2_A})
+        message(STATUS "ESurfingClient: nghttp2 static (${_ES_NGHTTP2_A})")
+    elseif (_ES_NGHTTP2_SO)
+        target_link_libraries(ESurfingClient PRIVATE ${_ES_NGHTTP2_SO})
+        if (_ES_WANT_STATIC)
+            list(APPEND _ES_DYNAMIC_BACKENDS "nghttp2")
+        endif ()
+        message(STATUS "ESurfingClient: nghttp2 dynamic (${_ES_NGHTTP2_SO})")
+    else ()
+        message(STATUS "ESurfingClient: nghttp2 not found")
+    endif ()
+
+    # A dynamic backend is incompatible with -static, so drop the flag.
+    if (_ES_DYNAMIC_BACKENDS)
+        message(WARNING
+                "ESurfingClient: dynamic-only backends: ${_ES_DYNAMIC_BACKENDS}; "
+                "dropping -static to produce a dynamically linked binary")
+        string(REPLACE "-static" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    endif ()
+
 
 endif ()
 
@@ -200,7 +287,14 @@ target_compile_options(ESurfingClient PRIVATE -Os)
 target_compile_options(ESurfingClient PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 if (__OPENWRT__)
-    set_target_properties(ESurfingClient PROPERTIES LINK_FLAGS "-Wl,--strip-all")
+    # Keep whatever LINK_FLAGS the backend probing produced above; when it
+    # dropped -static it must not be reintroduced here.
+    if (_ES_DYNAMIC_BACKENDS)
+        set_target_properties(ESurfingClient PROPERTIES
+                LINK_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--strip-all")
+    else ()
+        set_target_properties(ESurfingClient PROPERTIES LINK_FLAGS "-Wl,--strip-all")
+    endif ()
 else ()
     add_custom_command(TARGET ESurfingClient POST_BUILD
         COMMAND ${CMAKE_STRIP} "$<TARGET_FILE:ESurfingClient>"
