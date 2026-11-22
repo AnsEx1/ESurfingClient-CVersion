@@ -1,0 +1,202 @@
+name: Verify OpenWrt Build
+
+# 仅用于验证能否正常编译，不发布 Release，不改动版本号。
+# 产物以 artifact 形式保留 14 天。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'SDK target'
+        required: true
+        default: 'armsr-armv8'
+        type: choice
+        options:
+          - armsr-armv8
+          - armsr-armv7
+          - x86-64
+      architecture:
+        description: '包架构标识（仅用于产物命名）'
+        required: true
+        default: 'aarch64_generic'
+      sdk_version:
+        description: 'SDK 版本'
+        required: true
+        default: '25.12.6'
+        type: choice
+        options:
+          - 25.12.6
+          - 25.12.5
+          - 25.12-SNAPSHOT
+          - 24.10.8
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}-${{ github.event.inputs.target }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: openwrt/sdk:${{ github.event.inputs.target }}-${{ github.event.inputs.sdk_version }}
+      options: --user root
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 环境信息
+        run: |
+          echo "=========================================="
+          echo "SDK:        ${{ github.event.inputs.target }}-${{ github.event.inputs.sdk_version }}"
+          echo "架构标识:   ${{ github.event.inputs.architecture }}"
+          echo "=========================================="
+          echo "--- 编译器 ---"
+          ls /builder/staging_dir/ 2>/dev/null || true
+          which cc gcc 2>/dev/null || true
+          echo "--- SDK 版本 ---"
+          cat /builder/version 2>/dev/null || echo "(无 version 文件)"
+          grep -E "^CONFIG_TARGET_(BOARD|SUBTARGET|ARCH_PACKAGES)" /builder/.config 2>/dev/null || true
+
+      - name: 初始化 SDK
+        run: |
+          set -e
+          cd /builder
+          [ -f .config ] || make defconfig
+          echo "--- 目标平台 ---"
+          grep -E "CONFIG_TARGET_(BOARD|SUBTARGET|ARCH_PACKAGES)" .config | head -5 || true
+
+      - name: 安装 curl 并应用精简配置
+        run: |
+          set -e
+          cd /builder
+          scripts/feeds update packages
+          scripts/feeds install curl
+          # 使用仓库里的精简 curl 配置（关闭 HTTP2/SSL/ZLIB，避免静态库缺失）
+          cat "$GITHUB_WORKSPACE/ci/openwrt/all.config" >> .config
+          make defconfig
+          echo "--- libcurl 生效配置 ---"
+          grep -E "^CONFIG_LIBCURL_|^# CONFIG_LIBCURL_" .config | head -20 || true
+
+      - name: 编译 libcurl
+        run: |
+          set -e
+          cd /builder
+          make package/curl/compile -j$(nproc) V=s
+          echo "--- libcurl 产物 ---"
+          ls -la staging_dir/target-*/usr/lib/libcurl* 2>/dev/null || true
+          ls -la staging_dir/target-*/usr/include/curl/ 2>/dev/null | head -5 || true
+          ls -la staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc 2>/dev/null || true
+
+      - name: 编译 esurfingclient
+        id: build
+        run: |
+          set -e
+          cd /builder
+          cp -r "$GITHUB_WORKSPACE/esurfingclient" package/
+          scripts/feeds install esurfingclient
+          echo "--- 开始编译 ---"
+          if make package/esurfingclient/compile -j$(nproc) V=s 2>&1 | tee /tmp/build.log; then
+            echo "✅ 并行编译成功"
+          else
+            echo "::warning::并行编译失败，降级 -j1 重试"
+            make package/esurfingclient/compile -j1 V=s 2>&1 | tee -a /tmp/build.log
+          fi
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 收集产物
+        id: collect
+        run: |
+          set -e
+          cd /builder
+          echo "--- 查找所有产物 ---"
+          find bin/packages -type f \( -name "esurfingclient*" -o -name "luci-app-esurfingclient*" \) 2>/dev/null | tee /tmp/found.txt || true
+          COUNT=$(wc -l < /tmp/found.txt 2>/dev/null || echo 0)
+          echo "找到 $COUNT 个文件"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::未找到任何包产物"
+            echo "--- build_dir 内容 ---"
+            ls -la build_dir/target-*/esurfingclient/ 2>/dev/null | head -20 || true
+            exit 1
+          fi
+          mkdir -p /tmp/out
+          while IFS= read -r f; do
+            cp -v "$f" /tmp/out/
+          done < /tmp/found.txt
+          echo "--- 产物 ---"
+          ls -la /tmp/out/
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 验证产物架构
+        run: |
+          set -e
+          cd /builder
+          echo "--- 二进制架构检查 ---"
+          BIN=$(find build_dir/target-*/esurfingclient -name "ESurfingClient" -type f 2>/dev/null | head -1)
+          if [ -n "$BIN" ]; then
+            echo "二进制: $BIN"
+            file "$BIN" || true
+            echo "--- 是否静态链接 ---"
+            ldd "$BIN" 2>&1 | head -3 || true
+            echo "--- 体积 ---"
+            ls -lh "$BIN"
+            echo "--- 动态符号（应无 curl/SSL 依赖）---"
+            readelf -d "$BIN" 2>/dev/null | grep -E "NEEDED" || echo "  无 NEEDED（完全静态）"
+          else
+            echo "::warning::未找到二进制文件"
+          fi
+          echo ""
+          echo "--- 包内容 ---"
+          for pkg in /tmp/out/*; do
+            [ -f "$pkg" ] || continue
+            echo "=== $(basename "$pkg") ==="
+            case "$pkg" in
+              *.apk|*.ipk) tar -tzf "$pkg" 2>/dev/null | head -12 || echo "  (无法列出)" ;;
+            esac
+          done
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify-esurfingclient-${{ github.event.inputs.architecture }}-${{ github.event.inputs.sdk_version }}-run${{ github.run_number }}
+          path: /tmp/out/*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify-build-log-run${{ github.run_number }}
+          path: /tmp/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 结果摘要
+        if: always()
+        run: |
+          {
+            echo "## 编译验证结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| SDK | \`${{ github.event.inputs.target }}-${{ github.event.inputs.sdk_version }}\` |"
+            echo "| 架构 | \`${{ github.event.inputs.architecture }}\` |"
+            echo "| 编译状态 | ${{ steps.build.outputs.status == 'success' && '✅ 成功' || '❌ 失败' }} |"
+            echo "| 产物数 | $(ls /tmp/out/ 2>/dev/null | wc -l) |"
+            echo ""
+            echo "### 产物清单"
+            echo '```'
+            ls -la /tmp/out/ 2>/dev/null || echo "(无)"
+            echo '```'
+            echo ""
+            if [ -f /tmp/build.log ]; then
+              echo "### 编译日志末尾"
+              echo '```'
+              tail -40 /tmp/build.log
+              echo '```'
+            fi
+          } >> $GITHUB_STEP_SUMMARY
