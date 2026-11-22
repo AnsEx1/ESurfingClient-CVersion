@@ -42,7 +42,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@v7
@@ -142,27 +142,44 @@ jobs:
         run: |
           set -e
           cd openwrt
-          # 完整源码树在编译任何包之前必须先构建 host 工具与交叉工具链，
-          # 否则会报：
-          #   staging_dir/host/bin/openssl: No such file or directory
-          #   staging_dir/host/bin/libdeflate-gzip: No such file or directory
-          echo "=== tools/install ==="
-          make tools/install -j$(nproc) 2>&1 | tail -20
+
+          # 完整源码树必须先构建 host 工具与交叉工具链，否则编译任何包
+          # 都会报 staging_dir/host/bin/openssl: No such file or directory。
+          #
+          # 但 make tools/install 会编译约 200 个 host 包，在 4 核 runner
+          # 上需要 50-70 分钟。这里先只装必需的几个：
+          #   - openssl：package/Makefile 生成签名私钥要用
+          #   - libdeflate：解压 lua 等 tarball 要用（提供 libdeflate-gzip）
+          #   - tar/xz/zstd：解包
+          # 其余 host 工具留给后续 make 自动按需构建。
+          echo "=== 精简安装必需 host 工具 ==="
+          for t in tools/openssl tools/libdeflate tools/tar tools/xz tools/zstd; do
+            echo "--- $t ---"
+            if [ -d "$t" ] || make "$t/install" -n >/dev/null 2>&1; then
+              make "$t/install" -j$(nproc) 2>&1 | tail -5 || echo "  (跳过 $t)"
+            else
+              echo "  $t 不存在，跳过"
+            fi
+          done
+
           echo ""
-          echo "=== toolchain/install ==="
-          make toolchain/install -j$(nproc) 2>&1 | tail -20
-          echo ""
-          echo "=== 验证关键 host 工具 ==="
-          for t in openssl libdeflate-gzip ccache tar; do
-            if [ -x "staging_dir/host/bin/$t" ]; then
+          echo "=== 验证必需 host 工具 ==="
+          MISS=0
+          for t in openssl libdeflate-gzip tar gzip; do
+            if [ -x "staging_dir/host/bin/$t" ] || command -v "$t" >/dev/null 2>&1; then
               echo "  OK $t"
             else
               echo "  MISSING $t"
+              MISS=$((MISS+1))
             fi
           done
+          echo "缺失数: $MISS"
+
           echo ""
-          echo "=== 交叉工具链 ==="
-          ls staging_dir/toolchain-*/bin/*-gcc 2>/dev/null | head -3 || echo "  (无 gcc)"
+          echo "=== 构建交叉工具链（必需）==="
+          make toolchain/install -j$(nproc) 2>&1 | tail -15
+          echo ""
+          ls staging_dir/toolchain-*/bin/*-gcc 2>/dev/null | head -3 || echo "  (无交叉 gcc)"
 
       - name: 编译 libcurl
         run: |
@@ -245,6 +262,25 @@ jobs:
           else
             echo "(无二进制)"
           fi
+
+      - name: 打包 apk
+        if: steps.build.outputs.status == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          cd openwrt
+          # 注意：`make package/X/compile` 只编译不打包，产物停在
+          # build_dir，不会出现在 bin/packages 下。要得到 .apk 必须再跑
+          # `make package/X/install`（它会把包写进 bin/packages）。
+          echo "=== make package/esurfingclient/install ==="
+          make package/esurfingclient/install V=s 2>&1 | tail -30
+          echo "  exit=$?"
+          echo ""
+          echo "=== 查找产物 ==="
+          find bin -name "esurfingclient*" -type f 2>/dev/null | head -10
+          echo ""
+          echo "=== bin 目录结构 ==="
+          ls -R bin/packages 2>/dev/null | head -20 || echo "(无 bin/packages)"
 
       - name: 收集产物
         id: collect
