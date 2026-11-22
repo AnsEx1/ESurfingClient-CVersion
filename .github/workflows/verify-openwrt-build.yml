@@ -42,7 +42,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: verify-${{ github.ref }}-${{ github.event.inputs.target }}
+  # 把 curl_profile 纳入 group：minimal 与 firmware 是两个独立验证任务，
+  # 不应互相取消。同一 profile 重复触发时取消旧的。
+  group: verify-${{ github.ref }}-${{ github.event.inputs.target }}-${{ github.event.inputs.curl_profile }}-${{ github.event.inputs.sdk_version }}
   cancel-in-progress: true
 
 jobs:
@@ -246,6 +248,47 @@ jobs:
               fi
             done
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: SDK 内容取证
+        run: |
+          cd /builder
+          {
+            echo "## SDK 内容取证"
+            echo ""
+            echo "### /builder 顶层"
+            echo '```'
+            ls -la /builder 2>/dev/null | head -30
+            echo '```'
+            echo ""
+            echo "### staging_dir/target-*/usr/lib（开发库）"
+            echo '```'
+            ls -la staging_dir/target-*/usr/lib/*.a staging_dir/target-*/usr/lib/*.so 2>/dev/null | head -40 || echo "(无)"
+            echo '```'
+            echo ""
+            echo "### staging_dir/target-*/usr/include（头文件目录）"
+            echo '```'
+            ls staging_dir/target-*/usr/include/ 2>/dev/null | head -40 || echo "(无)"
+            echo '```'
+            echo ""
+            echo "### 是否已有 curl 开发文件"
+            echo '```'
+            ls -la staging_dir/target-*/usr/include/curl/ 2>/dev/null | head -10 || echo "(无 curl 头)"
+            ls -la staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc 2>/dev/null || echo "(无 libcurl.pc)"
+            echo '```'
+            echo ""
+            echo "### package/ 是否有 base 包"
+            echo '```'
+            ls package/ 2>/dev/null | head -20 || echo "(空)"
+            echo "--- package/libs ---"
+            ls package/libs/ 2>/dev/null | head -30 || echo "(无)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+          echo "========== 终端输出 =========="
+          echo "--- /builder 顶层 ---"; ls /builder 2>/dev/null | head -20
+          echo "--- staging usr/lib ---"; ls staging_dir/target-*/usr/lib/ 2>/dev/null | head -30
+          echo "--- staging usr/include ---"; ls staging_dir/target-*/usr/include/ 2>/dev/null | head -30
+          echo "--- package/ ---"; ls package/ 2>/dev/null | head -20
 
       - name: 编译 libcurl
         id: libcurl
