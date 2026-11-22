@@ -138,6 +138,32 @@ jobs:
           echo "--- 相关包是否选中 ---"
           grep -E "^CONFIG_PACKAGE_(libopenssl|libnghttp2|zlib|libcurl)" .config || echo "(部分未选中)"
 
+      - name: 构建 host 工具链
+        run: |
+          set -e
+          cd openwrt
+          # 完整源码树在编译任何包之前必须先构建 host 工具与交叉工具链，
+          # 否则会报：
+          #   staging_dir/host/bin/openssl: No such file or directory
+          #   staging_dir/host/bin/libdeflate-gzip: No such file or directory
+          echo "=== tools/install ==="
+          make tools/install -j$(nproc) 2>&1 | tail -20
+          echo ""
+          echo "=== toolchain/install ==="
+          make toolchain/install -j$(nproc) 2>&1 | tail -20
+          echo ""
+          echo "=== 验证关键 host 工具 ==="
+          for t in openssl libdeflate-gzip ccache tar; do
+            if [ -x "staging_dir/host/bin/$t" ]; then
+              echo "  OK $t"
+            else
+              echo "  MISSING $t"
+            fi
+          done
+          echo ""
+          echo "=== 交叉工具链 ==="
+          ls staging_dir/toolchain-*/bin/*-gcc 2>/dev/null | head -3 || echo "  (无 gcc)"
+
       - name: 编译 libcurl
         run: |
           set -e
