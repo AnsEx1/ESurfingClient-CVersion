@@ -1,0 +1,287 @@
+name: Verify Full Source Build
+
+# 用完整的 openwrt/openwrt 源码树模拟整机构建环境。
+#
+# 与 verify-openwrt-build.yml（SDK 版）的区别：
+#   SDK 版  package/ 只有 feeds/kernel/toolchain，没有 libs/，
+#           因此无法构建带 OpenSSL 的 curl，firmware 模式不可能成功。
+#   本工作流 克隆完整源码树，package/libs 齐全，可以打开
+#           HTTP2 + OpenSSL + ZLIB，真正复现整机构建时的 libcurl。
+#
+# 目标：验证 ESurfingClient 在「libcurl 全功能」环境下能否编译通过。
+# 预期：nghttp2 只有 .so，CMakeLists 的探测逻辑会移除 -static
+#       并降级为动态链接，编译成功。
+
+on:
+  workflow_dispatch:
+    inputs:
+      curl_profile:
+        description: 'libcurl 配置'
+        required: true
+        default: 'firmware'
+        type: choice
+        options:
+          - firmware
+          - minimal
+      openwrt_ref:
+        description: 'OpenWrt 分支'
+        required: true
+        default: 'openwrt-25.12'
+        type: choice
+        options:
+          - openwrt-25.12
+          - openwrt-24.10
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fullsrc-${{ github.ref }}-${{ github.event.inputs.curl_profile }}-${{ github.event.inputs.openwrt_ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 环境信息
+        run: |
+          echo "=========================================="
+          echo "OpenWrt 分支: ${{ github.event.inputs.openwrt_ref }}"
+          echo "curl 配置:    ${{ github.event.inputs.curl_profile }}"
+          echo "=========================================="
+          nproc
+          free -h
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools python3-pyelftools rsync \
+            swig unzip zlib1g-dev file wget ccache 2>&1 | tail -5
+          echo "依赖安装完成"
+
+      - name: 克隆 OpenWrt 源码
+        run: |
+          set -e
+          git clone --depth=1 --branch "${{ github.event.inputs.openwrt_ref }}" \
+            https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          echo "--- 源码版本 ---"
+          git log -1 --format="%H %ci %s"
+          echo "--- package/libs 是否齐全 ---"
+          ls package/libs/ | head -30
+          echo "--- openssl / zlib 是否存在 ---"
+          ls -d package/libs/openssl package/libs/zlib 2>/dev/null || echo "缺失"
+
+      - name: 配置目标平台
+        run: |
+          set -e
+          cd openwrt
+          # 使用与 NanoPi R4S 一致的目标
+          # 用循环 printf 逐行写入，避免 YAML 里 heredoc 的缩进污染 .config
+          for opt in \
+            CONFIG_TARGET_rockchip=y \
+            CONFIG_TARGET_rockchip_armv8=y \
+            CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r4s=y
+          do
+            printf '%s\n' "$opt" > .config.tmp
+            cat .config.tmp >> .config
+          done
+          rm -f .config.tmp
+          make defconfig
+          echo "--- 目标确认 ---"
+          grep -E "CONFIG_TARGET_(BOARD|SUBTARGET|ARCH_PACKAGES)" .config | head -5
+
+      - name: 更新 feeds 并配置 libcurl
+        run: |
+          set -e
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install curl
+
+          if [ "${{ github.event.inputs.curl_profile }}" = "firmware" ]; then
+            echo "=== firmware：libcurl 全功能（HTTP2 + OpenSSL + ZLIB）==="
+            for opt in \
+              CONFIG_PACKAGE_libcurl=y \
+              CONFIG_LIBCURL_HTTP=y \
+              CONFIG_LIBCURL_HTTP2=y \
+              CONFIG_LIBCURL_OPENSSL=y \
+              CONFIG_LIBCURL_ZLIB=y \
+              CONFIG_LIBCURL_COOKIES=y \
+              CONFIG_LIBCURL_CRYPTO_AUTH=y \
+              CONFIG_LIBCURL_FILE=y \
+              CONFIG_LIBCURL_FTP=y \
+              CONFIG_LIBCURL_HTTP_AUTH=y \
+              CONFIG_LIBCURL_PROXY=y \
+              CONFIG_LIBCURL_TFTP=y \
+              CONFIG_LIBCURL_THREADED_RESOLVER=y \
+              CONFIG_LIBCURL_TLS_SRP=y \
+              CONFIG_LIBCURL_UNIX_SOCKETS=y
+            do
+              printf '%s\n' "$opt" >> .config
+            done
+          else
+            echo "=== minimal：精简 libcurl（关闭 HTTP2/SSL/ZLIB）==="
+            cat "$GITHUB_WORKSPACE/ci/openwrt/all.config" >> .config
+          fi
+
+          make defconfig
+          echo "--- 生效的 libcurl 选项 ---"
+          grep -E "^CONFIG_LIBCURL_|^# CONFIG_LIBCURL_" .config | head -20
+          echo "--- 相关包是否选中 ---"
+          grep -E "^CONFIG_PACKAGE_(libopenssl|libnghttp2|zlib|libcurl)" .config || echo "(部分未选中)"
+
+      - name: 编译 libcurl
+        run: |
+          set -e
+          cd openwrt
+          echo "=== 编译 curl（含全部依赖：openssl / nghttp2 / zlib）==="
+          if make package/curl/compile -j$(nproc) V=s 2>&1 | tee /tmp/curl.log; then
+            echo "✅ curl 编译成功"
+          else
+            echo "::error::curl 编译失败"
+            tail -60 /tmp/curl.log
+            exit 1
+          fi
+          echo ""
+          echo "=== 后端库产物检查 ==="
+          for f in \
+            "staging_dir/target-*/usr/include/openssl/opensslv.h" \
+            "staging_dir/target-*/usr/lib/libssl.a" \
+            "staging_dir/target-*/usr/lib/libcrypto.a" \
+            "staging_dir/target-*/usr/include/nghttp2/nghttp2.h" \
+            "staging_dir/target-*/usr/lib/libnghttp2.a" \
+            "staging_dir/target-*/usr/lib/libnghttp2.so" \
+            "staging_dir/target-*/usr/lib/libz.a" \
+            "staging_dir/target-*/usr/lib/libcurl.a" \
+            "staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc"
+          do
+            if ls $f >/dev/null 2>&1; then echo "  ✅ $f"; else echo "  ❌ $f"; fi
+          done
+          echo ""
+          echo "=== libcurl.pc 的 Libs.private ==="
+          grep -E "^(Libs|Libs.private|Cflags)" staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc 2>/dev/null || echo "(无)"
+
+      - name: 编译 esurfingclient
+        id: build
+        run: |
+          cd openwrt
+          cp -r "$GITHUB_WORKSPACE/esurfingclient" package/
+          ./scripts/feeds install esurfingclient 2>/dev/null || true
+
+          echo "=== CMakeLists 链接配置（编译前确认）==="
+          grep -nE "find_library|_ES_DYNAMIC_BACKENDS|dropping -static" \
+            package/esurfingclient/app/CMakeLists.txt | head -12 || true
+
+          echo ""
+          echo "=== 开始编译 ==="
+          if make package/esurfingclient/compile -j$(nproc) V=s 2>&1 | tee /tmp/build.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ esurfingclient 编译成功"
+          else
+            echo "::warning::并行失败，降级 -j1 重试"
+            if make package/esurfingclient/compile -j1 V=s 2>&1 | tee -a /tmp/build.log; then
+              echo "status=success" >> $GITHUB_OUTPUT
+              echo "✅ 单线程编译成功"
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              echo "::error::编译失败"
+              grep -c "undefined reference to" /tmp/build.log || true
+              grep -E "attempted static link|undefined reference" /tmp/build.log | head -8 || true
+              tail -40 /tmp/build.log
+            fi
+          fi
+
+      - name: 链接过程取证
+        if: always()
+        run: |
+          cd openwrt
+          echo "=== CMake 探测结果 ==="
+          grep -E "ESurfingClient: (OpenSSL|zlib|nghttp2|dynamic-only)" /tmp/build.log 2>/dev/null || echo "(无探测输出)"
+          echo ""
+          echo "=== 链接命令（库参数）==="
+          grep -oE "\-l[a-zA-Z0-9_.]+|lib[a-z0-9_]+\.a" /tmp/build.log 2>/dev/null | sort -u | head -20 || echo "(无)"
+          echo ""
+          echo "=== 最终二进制 ==="
+          BIN=$(find build_dir/target-*/esurfingclient -name "ESurfingClient" -type f 2>/dev/null | head -1)
+          if [ -n "$BIN" ]; then
+            file "$BIN"
+            ldd "$BIN" 2>&1 | head -5 || true
+            readelf -d "$BIN" 2>/dev/null | grep NEEDED || echo "  无 NEEDED（完全静态）"
+            ls -lh "$BIN"
+          else
+            echo "(无二进制)"
+          fi
+
+      - name: 收集产物
+        id: collect
+        run: |
+          cd openwrt
+          find bin/packages -type f -name "esurfingclient*" 2>/dev/null | tee /tmp/found.txt || true
+          COUNT=$(grep -c . /tmp/found.txt 2>/dev/null || echo 0)
+          echo "找到 $COUNT 个产物"
+          mkdir -p /tmp/out
+          if [ "$COUNT" -gt 0 ]; then
+            while IFS= read -r f; do [ -n "$f" ] && cp -v "$f" /tmp/out/; done < /tmp/found.txt
+            echo "status=ok" >> $GITHUB_OUTPUT
+          else
+            echo "status=none" >> $GITHUB_OUTPUT
+          fi
+          ls -la /tmp/out/ 2>/dev/null || true
+
+      - name: 上传产物
+        if: steps.collect.outputs.status == 'ok'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fullsrc-${{ github.event.inputs.curl_profile }}-${{ github.event.inputs.openwrt_ref }}-run${{ github.run_number }}
+          path: /tmp/out/*
+          retention-days: 14
+
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fullsrc-logs-${{ github.event.inputs.curl_profile }}-run${{ github.run_number }}
+          path: |
+            /tmp/build.log
+            /tmp/curl.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 结果摘要
+        if: always()
+        run: |
+          ST="${{ steps.build.outputs.status }}"
+          {
+            echo "## 完整源码树编译验证"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| OpenWrt 分支 | \`${{ github.event.inputs.openwrt_ref }}\` |"
+            echo "| curl 配置 | \`${{ github.event.inputs.curl_profile }}\` |"
+            echo "| 结果 | $([ "$ST" = "success" ] && echo '✅ 成功' || echo '❌ 失败') |"
+            echo "| 产物 | $(ls /tmp/out/ 2>/dev/null | wc -l) 个 |"
+            echo ""
+            echo "### CMake 后端探测"
+            echo '```'
+            grep -E "ESurfingClient: (OpenSSL|zlib|nghttp2|dynamic-only)" /tmp/build.log 2>/dev/null || echo "(无)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 最终判定
+        if: always()
+        run: |
+          ST="${{ steps.build.outputs.status }}"
+          if [ "$ST" = "success" ]; then
+            echo "✅ 编译成功（curl_profile=${{ github.event.inputs.curl_profile }}）"
+            exit 0
+          fi
+          echo "❌ 编译失败"
+          exit 1
