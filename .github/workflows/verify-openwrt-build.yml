@@ -29,6 +29,14 @@ on:
           - 25.12.5
           - 25.12-SNAPSHOT
           - 24.10.8
+      curl_profile:
+        description: 'libcurl 编译配置（minimal=精简，firmware=固件同款全功能）'
+        required: true
+        default: 'minimal'
+        type: choice
+        options:
+          - minimal
+          - firmware
 
 permissions:
   contents: read
@@ -69,27 +77,65 @@ jobs:
           echo "--- 目标平台 ---"
           grep -E "CONFIG_TARGET_(BOARD|SUBTARGET|ARCH_PACKAGES)" .config | head -5 || true
 
-      - name: 安装 curl 并应用精简配置
+      - name: 安装 curl 并应用编译配置
+        id: curlcfg
         run: |
           set -e
           cd /builder
           scripts/feeds update packages
           scripts/feeds install curl
-          # 使用仓库里的精简 curl 配置（关闭 HTTP2/SSL/ZLIB，避免静态库缺失）
-          cat "$GITHUB_WORKSPACE/ci/openwrt/all.config" >> .config
+
+          if [ "${{ github.event.inputs.curl_profile }}" = "firmware" ]; then
+            echo "=== 使用固件同款配置（HTTP2 + OpenSSL + ZLIB 全开）==="
+            # 复刻 OpenWrt-R4S 固件 .config 里的 libcurl 选项
+            # 用循环 printf 逐行写入，避免 heredoc 缩进污染 .config
+            for opt in \
+              CONFIG_PACKAGE_libcurl=y \
+              CONFIG_LIBCURL_HTTP=y \
+              CONFIG_LIBCURL_HTTP2=y \
+              CONFIG_LIBCURL_OPENSSL=y \
+              CONFIG_LIBCURL_ZLIB=y \
+              CONFIG_LIBCURL_COOKIES=y \
+              CONFIG_LIBCURL_CRYPTO_AUTH=y \
+              CONFIG_LIBCURL_FILE=y \
+              CONFIG_LIBCURL_FTP=y \
+              CONFIG_LIBCURL_HTTP_AUTH=y \
+              CONFIG_LIBCURL_PROXY=y \
+              CONFIG_LIBCURL_TFTP=y \
+              CONFIG_LIBCURL_THREADED_RESOLVER=y \
+              CONFIG_LIBCURL_TLS_SRP=y \
+              CONFIG_LIBCURL_UNIX_SOCKETS=y
+            do
+              printf '%s\n' "$opt" >> .config
+            done
+          else
+            echo "=== 使用精简配置（关闭 HTTP2/SSL/ZLIB）==="
+            cat "$GITHUB_WORKSPACE/ci/openwrt/all.config" >> .config
+          fi
+
           make defconfig
           echo "--- libcurl 生效配置 ---"
-          grep -E "^CONFIG_LIBCURL_|^# CONFIG_LIBCURL_" .config | head -20 || true
+          grep -E "^CONFIG_LIBCURL_|^# CONFIG_LIBCURL_" .config | grep -v "^CONFIG_LIBCURL_\(COOKIES\|FILE\|FTP\|HTTP_AUTH\|PROXY\)" | head -25 || true
+          echo "--- 依赖检查 ---"
+          grep -E "^CONFIG_PACKAGE_(libnghttp2|libopenssl|zlib|libcurl)" .config || true
 
       - name: 编译 libcurl
+        id: libcurl
+        continue-on-error: true
         run: |
           set -e
           cd /builder
-          make package/curl/compile -j$(nproc) V=s
-          echo "--- libcurl 产物 ---"
-          ls -la staging_dir/target-*/usr/lib/libcurl* 2>/dev/null || true
-          ls -la staging_dir/target-*/usr/include/curl/ 2>/dev/null | head -5 || true
-          ls -la staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc 2>/dev/null || true
+          if make package/curl/compile -j$(nproc) V=s 2>&1 | tee /tmp/curl.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "--- libcurl 产物 ---"
+            ls -la staging_dir/target-*/usr/lib/libcurl* 2>/dev/null || true
+            ls -la staging_dir/target-*/usr/include/curl/ 2>/dev/null | head -5 || true
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "::error::libcurl 编译失败"
+            tail -50 /tmp/curl.log
+            exit 1
+          fi
 
       - name: 编译 esurfingclient
         id: build
@@ -98,14 +144,35 @@ jobs:
           cd /builder
           cp -r "$GITHUB_WORKSPACE/esurfingclient" package/
           scripts/feeds install esurfingclient
-          echo "--- 开始编译 ---"
+          echo "--- 开始编译 (curl_profile=${{ github.event.inputs.curl_profile }}) ---"
           if make package/esurfingclient/compile -j$(nproc) V=s 2>&1 | tee /tmp/build.log; then
             echo "✅ 并行编译成功"
+            echo "status=success" >> $GITHUB_OUTPUT
           else
             echo "::warning::并行编译失败，降级 -j1 重试"
-            make package/esurfingclient/compile -j1 V=s 2>&1 | tee -a /tmp/build.log
+            if make package/esurfingclient/compile -j1 V=s 2>&1 | tee -a /tmp/build.log; then
+              echo "status=success"
+              echo "status=success" >> $GITHUB_OUTPUT
+            else
+              echo "status=failure" >> $GITHUB_OUTPUT
+              if [ "${{ github.event.inputs.curl_profile }}" = "firmware" ]; then
+                echo "::warning::固件同款配置下编译失败——这是预期的（静态链接缺 libnghttp2.a）"
+                echo "--- 未定义符号统计 ---"
+                grep -c "undefined reference to" /tmp/build.log || true
+                echo "--- 按库分类 ---"
+                grep -o "undefined reference to \`[a-zA-Z0-9_]*'" /tmp/build.log 2>/dev/null \
+                  | sed "s/.*\`//; s/'//" \
+                  | sed -E 's/^(nghttp2|SSL|OPENSSL|EVP|X509|BIO|ERR|OSSL|inflate|deflate|compress|ASN1|BN|CRYPTO|d2i|ENGINE|OCSP|PEM|PKCS|RAND|TLS|UI)_.*/\1/' \
+                  | sort | uniq -c | sort -rn | head -15 || true
+                echo "--- 关键错误行 ---"
+                grep -E "attempted static link|undefined reference" /tmp/build.log | head -5 || true
+              else
+                echo "::error::编译失败"
+                tail -60 /tmp/build.log
+                exit 1
+              fi
+            fi
           fi
-          echo "status=success" >> $GITHUB_OUTPUT
 
       - name: 收集产物
         id: collect
@@ -114,18 +181,22 @@ jobs:
           cd /builder
           echo "--- 查找所有产物 ---"
           find bin/packages -type f \( -name "esurfingclient*" -o -name "luci-app-esurfingclient*" \) 2>/dev/null | tee /tmp/found.txt || true
-          COUNT=$(wc -l < /tmp/found.txt 2>/dev/null || echo 0)
+          COUNT=$(wc -l < /tmp/found.txt 2>/dev/null | head -1 || echo 0)
           echo "找到 $COUNT 个文件"
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::error::未找到任何包产物"
-            echo "--- build_dir 内容 ---"
-            ls -la build_dir/target-*/esurfingclient/ 2>/dev/null | head -20 || true
-            exit 1
-          fi
           mkdir -p /tmp/out
-          while IFS= read -r f; do
-            cp -v "$f" /tmp/out/
-          done < /tmp/found.txt
+          if [ "$COUNT" -eq 0 ]; then
+            if [ "${{ steps.build.outputs.status }}" = "success" ]; then
+              echo "::error::编译报告成功但未找到产物"
+              exit 1
+            fi
+            echo "::warning::编译失败，无产物（符合预期）"
+            echo "status=none" >> $GITHUB_OUTPUT
+          else
+            while IFS= read -r f; do
+              cp -v "$f" /tmp/out/
+            done < /tmp/found.txt
+            echo "status=ok" >> $GITHUB_OUTPUT
+          fi
           echo "--- 产物 ---"
           ls -la /tmp/out/
           echo "status=success" >> $GITHUB_OUTPUT
@@ -159,9 +230,10 @@ jobs:
           done
 
       - name: 上传产物
+        if: steps.collect.outputs.status == 'ok'
         uses: actions/upload-artifact@v7
         with:
-          name: verify-esurfingclient-${{ github.event.inputs.architecture }}-${{ github.event.inputs.sdk_version }}-run${{ github.run_number }}
+          name: verify-esurfingclient-${{ github.event.inputs.architecture }}-${{ github.event.inputs.sdk_version }}-${{ github.event.inputs.curl_profile }}-run${{ github.run_number }}
           path: /tmp/out/*
           retention-days: 14
           if-no-files-found: error
@@ -170,14 +242,27 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: verify-build-log-run${{ github.run_number }}
-          path: /tmp/build.log
+          name: verify-build-log-${{ github.event.inputs.curl_profile }}-run${{ github.run_number }}
+          path: |
+            /tmp/build.log
+            /tmp/curl.log
           retention-days: 7
           if-no-files-found: ignore
 
       - name: 结果摘要
         if: always()
         run: |
+          BUILD_STATUS="${{ steps.build.outputs.status }}"
+          PROFILE="${{ github.event.inputs.curl_profile }}"
+
+          if [ "$BUILD_STATUS" = "success" ]; then
+            VERDICT="✅ 编译成功"
+          elif [ "$PROFILE" = "firmware" ]; then
+            VERDICT="⚠️ 编译失败（固件同款配置下的预期结果）"
+          else
+            VERDICT="❌ 编译失败"
+          fi
+
           {
             echo "## 编译验证结果"
             echo ""
@@ -185,18 +270,54 @@ jobs:
             echo "|---|---|"
             echo "| SDK | \`${{ github.event.inputs.target }}-${{ github.event.inputs.sdk_version }}\` |"
             echo "| 架构 | \`${{ github.event.inputs.architecture }}\` |"
-            echo "| 编译状态 | ${{ steps.build.outputs.status == 'success' && '✅ 成功' || '❌ 失败' }} |"
+            echo "| curl 配置 | \`$PROFILE\` |"
+            echo "| 结果 | $VERDICT |"
             echo "| 产物数 | $(ls /tmp/out/ 2>/dev/null | wc -l) |"
             echo ""
+            if [ "$PROFILE" = "firmware" ]; then
+              echo "> **固件同款配置**：libcurl 启用 HTTP2 + OpenSSL + ZLIB。"
+              echo "> 此模式下若编译失败，属于已知问题——静态链接需要 \`libnghttp2.a\`，"
+              echo "> 但 OpenWrt 的 nghttp2 包只构建动态库。"
+              echo ""
+            fi
             echo "### 产物清单"
             echo '```'
-            ls -la /tmp/out/ 2>/dev/null || echo "(无)"
+            ls -la /tmp/out/ 2>/dev/null || echo "(无产物)"
             echo '```'
             echo ""
             if [ -f /tmp/build.log ]; then
+              echo "### 未定义符号统计（如有）"
+              echo '```'
+              grep -o "undefined reference to \`[a-zA-Z0-9_]*'" /tmp/build.log 2>/dev/null \
+                | sed "s/.*\`//; s/'//" \
+                | sed -E 's/^(nghttp2|SSL|OPENSSL|EVP|X509|BIO|ERR|OSSL|inflate|deflate|compress|ASN1|BN|CRYPTO|d2i|ENGINE|OCSP|PEM|PKCS|RAND|TLS|UI)_.*/\1/' \
+                | sort | uniq -c | sort -rn | head -15 || echo "(无未定义符号)"
+              echo '```'
+              echo ""
               echo "### 编译日志末尾"
               echo '```'
-              tail -40 /tmp/build.log
+              tail -30 /tmp/build.log
               echo '```'
             fi
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: 最终判定
+        if: always()
+        run: |
+          BUILD_STATUS="${{ steps.build.outputs.status }}"
+          PROFILE="${{ github.event.inputs.curl_profile }}"
+
+          if [ "$BUILD_STATUS" = "success" ]; then
+            echo "✅ 编译成功（curl_profile=$PROFILE）"
+            exit 0
+          fi
+
+          if [ "$PROFILE" = "firmware" ]; then
+            echo "⚠️ 固件同款配置下编译失败——这正是预期结果"
+            echo "   原因：静态链接需要 libnghttp2.a，OpenWrt 的 nghttp2 包只构建 .so"
+            echo "   该模式的用途是复现整机构建的失败，验证诊断结论"
+            exit 0
+          fi
+
+          echo "❌ 精简配置下编译失败，这是真实问题"
+          exit 1
