@@ -122,27 +122,44 @@ jobs:
       - name: 预编译依赖库
         if: github.event.inputs.curl_profile == 'firmware'
         run: |
-          set -e
           cd /builder
           # firmware 模式下 curl 需要 OpenSSL 与 nghttp2 的开发文件，
           # 但 SDK 只带基础工具链，这些库必须自己编译。
-          for pkg in libs/openssl feeds/packages/libs/nghttp2; do
-            name=$(basename "$pkg")
-            if [ -d "package/$pkg" ] || [ -d "feeds/packages/libs/$name" ]; then
-              echo "=== 编译 $name ==="
-              make "package/$pkg/compile" -j$(nproc) V=s 2>&1 | tail -20 || {
-                echo "::warning::$name 编译失败，继续（让 curl 的报错暴露真实问题）"
-              }
-            else
-              echo "  $pkg 目录不存在，跳过"
-            fi
-          done
-          echo "--- 检查 OpenSSL 开发文件 ---"
-          ls -la staging_dir/target-*/usr/include/openssl/ 2>/dev/null | head -5 || echo "  (无 openssl 头文件)"
-          ls -la staging_dir/target-*/usr/lib/libssl* staging_dir/target-*/usr/lib/libcrypto* 2>/dev/null || echo "  (无 openssl 库)"
-          echo "--- 检查 nghttp2 开发文件 ---"
-          ls -la staging_dir/target-*/usr/include/nghttp2/ 2>/dev/null | head -3 || echo "  (无 nghttp2 头文件)"
-          ls -la staging_dir/target-*/usr/lib/libnghttp2* 2>/dev/null || echo "  (无 nghttp2 库)"
+          #
+          # 路径注意：openwrt-25.12 里
+          #   openssl 在 package/libs/openssl（base feed，主仓库内）
+          #   nghttp2 在 feeds/packages/libs/nghttp2（packages feed）
+          echo "--- 确认源码位置 ---"
+          ls -d package/libs/openssl 2>/dev/null && echo "  ✅ openssl 在 base"
+          ls -d feeds/packages/libs/nghttp2 2>/dev/null && echo "  ✅ nghttp2 在 packages feed"
+
+          echo ""
+          echo "=== 编译 OpenSSL ==="
+          make package/libs/openssl/compile -j$(nproc) V=s 2>&1 | tail -25 || \
+            echo "::warning::OpenSSL 编译失败"
+
+          echo ""
+          echo "=== 编译 nghttp2 ==="
+          make package/feeds/packages/nghttp2/compile -j$(nproc) V=s 2>&1 | tail -25 || \
+            echo "::warning::nghttp2 编译失败"
+
+          echo ""
+          echo "=== 编译 zlib ==="
+          make package/libs/zlib/compile -j$(nproc) V=s 2>&1 | tail -15 || \
+            echo "::warning::zlib 编译失败"
+
+          echo ""
+          echo "--- 开发文件检查 ---"
+          echo "OpenSSL 头文件:"
+          ls staging_dir/target-*/usr/include/openssl/opensslv.h 2>/dev/null && echo "  ✅ 有" || echo "  ❌ 无"
+          echo "OpenSSL 库:"
+          ls staging_dir/target-*/usr/lib/libssl.so staging_dir/target-*/usr/lib/libcrypto.so 2>/dev/null || echo "  ❌ 无"
+          echo "nghttp2 头文件:"
+          ls staging_dir/target-*/usr/include/nghttp2/nghttp2.h 2>/dev/null && echo "  ✅ 有" || echo "  ❌ 无"
+          echo "nghttp2 库:"
+          ls staging_dir/target-*/usr/lib/libnghttp2.* 2>/dev/null || echo "  ❌ 无"
+          echo "zlib:"
+          ls staging_dir/target-*/usr/lib/libz.* 2>/dev/null || echo "  ❌ 无"
 
       - name: 编译 libcurl
         id: libcurl
@@ -202,29 +219,29 @@ jobs:
       - name: 收集产物
         id: collect
         run: |
-          set -e
           cd /builder
           echo "--- 查找所有产物 ---"
           find bin/packages -type f \( -name "esurfingclient*" -o -name "luci-app-esurfingclient*" \) 2>/dev/null | tee /tmp/found.txt || true
-          COUNT=$(wc -l < /tmp/found.txt 2>/dev/null | head -1 || echo 0)
+          COUNT=$(grep -c . /tmp/found.txt 2>/dev/null || echo 0)
           echo "找到 $COUNT 个文件"
           mkdir -p /tmp/out
+
           if [ "$COUNT" -eq 0 ]; then
             if [ "${{ steps.build.outputs.status }}" = "success" ]; then
               echo "::error::编译报告成功但未找到产物"
+              echo "status=none" >> $GITHUB_OUTPUT
               exit 1
             fi
             echo "::warning::编译失败，无产物（符合预期）"
             echo "status=none" >> $GITHUB_OUTPUT
           else
             while IFS= read -r f; do
-              cp -v "$f" /tmp/out/
+              [ -n "$f" ] && cp -v "$f" /tmp/out/
             done < /tmp/found.txt
             echo "status=ok" >> $GITHUB_OUTPUT
           fi
           echo "--- 产物 ---"
-          ls -la /tmp/out/
-          echo "status=success" >> $GITHUB_OUTPUT
+          ls -la /tmp/out/ 2>/dev/null || echo "(空)"
 
       - name: 验证产物架构
         run: |
