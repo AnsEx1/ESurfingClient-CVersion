@@ -119,6 +119,31 @@ jobs:
           echo "--- 依赖检查 ---"
           grep -E "^CONFIG_PACKAGE_(libnghttp2|libopenssl|zlib|libcurl)" .config || true
 
+      - name: 预编译依赖库
+        if: github.event.inputs.curl_profile == 'firmware'
+        run: |
+          set -e
+          cd /builder
+          # firmware 模式下 curl 需要 OpenSSL 与 nghttp2 的开发文件，
+          # 但 SDK 只带基础工具链，这些库必须自己编译。
+          for pkg in libs/openssl feeds/packages/libs/nghttp2; do
+            name=$(basename "$pkg")
+            if [ -d "package/$pkg" ] || [ -d "feeds/packages/libs/$name" ]; then
+              echo "=== 编译 $name ==="
+              make "package/$pkg/compile" -j$(nproc) V=s 2>&1 | tail -20 || {
+                echo "::warning::$name 编译失败，继续（让 curl 的报错暴露真实问题）"
+              }
+            else
+              echo "  $pkg 目录不存在，跳过"
+            fi
+          done
+          echo "--- 检查 OpenSSL 开发文件 ---"
+          ls -la staging_dir/target-*/usr/include/openssl/ 2>/dev/null | head -5 || echo "  (无 openssl 头文件)"
+          ls -la staging_dir/target-*/usr/lib/libssl* staging_dir/target-*/usr/lib/libcrypto* 2>/dev/null || echo "  (无 openssl 库)"
+          echo "--- 检查 nghttp2 开发文件 ---"
+          ls -la staging_dir/target-*/usr/include/nghttp2/ 2>/dev/null | head -3 || echo "  (无 nghttp2 头文件)"
+          ls -la staging_dir/target-*/usr/lib/libnghttp2* 2>/dev/null || echo "  (无 nghttp2 库)"
+
       - name: 编译 libcurl
         id: libcurl
         continue-on-error: true
