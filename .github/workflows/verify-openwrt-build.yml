@@ -284,11 +284,39 @@ jobs:
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
 
-          echo "========== 终端输出 =========="
-          echo "--- /builder 顶层 ---"; ls /builder 2>/dev/null | head -20
-          echo "--- staging usr/lib ---"; ls staging_dir/target-*/usr/lib/ 2>/dev/null | head -30
-          echo "--- staging usr/include ---"; ls staging_dir/target-*/usr/include/ 2>/dev/null | head -30
-          echo "--- package/ ---"; ls package/ 2>/dev/null | head -20
+          # 同时写入文件，随 artifact 上传（日志 API 下载受限，用 artifact 更可靠）
+          {
+            echo "===== SDK 取证 ====="
+            echo "--- /builder 顶层 ---"
+            ls /builder 2>/dev/null
+            echo ""
+            echo "--- package/ ---"
+            ls package/ 2>/dev/null
+            echo ""
+            echo "--- staging usr/lib 静态库 ---"
+            ls staging_dir/target-*/usr/lib/*.a 2>/dev/null
+            echo ""
+            echo "--- staging usr/lib 动态库 ---"
+            ls staging_dir/target-*/usr/lib/*.so 2>/dev/null
+            echo ""
+            echo "--- staging usr/include ---"
+            ls staging_dir/target-*/usr/include/ 2>/dev/null
+            echo ""
+            echo "--- curl 头文件 ---"
+            ls staging_dir/target-*/usr/include/curl/ 2>/dev/null
+            echo ""
+            echo "--- libcurl.pc ---"
+            cat staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc 2>/dev/null
+            echo ""
+            echo "--- feeds ---"
+            ls feeds/ 2>/dev/null
+            echo ""
+            echo "--- feeds.conf ---"
+            cat feeds.conf 2>/dev/null
+          } > /tmp/sdk-info.txt 2>&1
+
+          echo "========== 取证摘要 =========="
+          cat /tmp/sdk-info.txt
 
       - name: 编译 libcurl
         id: libcurl
@@ -417,6 +445,7 @@ jobs:
           path: |
             /tmp/build.log
             /tmp/curl.log
+            /tmp/sdk-info.txt
           retention-days: 7
           if-no-files-found: ignore
 
