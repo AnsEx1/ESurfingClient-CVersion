@@ -123,43 +123,102 @@ jobs:
         if: github.event.inputs.curl_profile == 'firmware'
         run: |
           cd /builder
-          # firmware 模式下 curl 需要 OpenSSL 与 nghttp2 的开发文件，
-          # 但 SDK 只带基础工具链，这些库必须自己编译。
-          #
-          # 路径注意：openwrt-25.12 里
-          #   openssl 在 package/libs/openssl（base feed，主仓库内）
-          #   nghttp2 在 feeds/packages/libs/nghttp2（packages feed）
-          echo "--- 确认源码位置 ---"
-          ls -d package/libs/openssl 2>/dev/null && echo "  ✅ openssl 在 base"
-          ls -d feeds/packages/libs/nghttp2 2>/dev/null && echo "  ✅ nghttp2 在 packages feed"
+
+          echo "========== SDK 结构诊断 =========="
+          echo "--- /builder 顶层 ---"
+          ls -d */ 2>/dev/null | head -20
+          echo "--- package/ 目录 ---"
+          ls package/ 2>/dev/null | head -20
+          echo "--- package/libs/ 是否存在 ---"
+          if [ -d package/libs ]; then
+            echo "  ✅ 存在，内容："
+            ls package/libs/ 2>/dev/null | head -30
+          else
+            echo "  ❌ package/libs 不存在"
+          fi
+          echo "--- feeds/ 目录 ---"
+          ls feeds/ 2>/dev/null
+          echo "--- feeds.conf ---"
+          cat feeds.conf 2>/dev/null || echo "  (无)"
+          echo ""
+
+          echo "========== 查找 openssl / zlib 源码 =========="
+          for name in openssl zlib; do
+            echo "--- $name ---"
+            found=$(find . -maxdepth 5 -type d -name "$name" -path "*libs*" 2>/dev/null | head -3)
+            if [ -n "$found" ]; then
+              echo "$found" | while read -r d; do echo "  找到: $d"; done
+            else
+              echo "  ❌ 未找到"
+            fi
+          done
+          echo ""
+
+          echo "========== 编译依赖 =========="
+          # 只编译实际存在的目标，避免 make 对不存在的目标静默成功
+          compile_if_exists() {
+            local target="$1"
+            local dir="$2"
+            if [ -d "$dir" ]; then
+              echo "=== 编译 $target ==="
+              if make "$target" -j$(nproc) V=s 2>&1 | tail -20; then
+                echo "  ✅ $target 完成"
+              else
+                echo "  ⚠️ $target 失败"
+              fi
+            else
+              echo "  ⏭ $target 跳过（$dir 不存在）"
+            fi
+          }
+
+          compile_if_exists "package/libs/openssl/compile" "package/libs/openssl"
+          compile_if_exists "package/libs/zlib/compile" "package/libs/zlib"
+          compile_if_exists "package/feeds/packages/nghttp2/compile" "feeds/packages/libs/nghttp2"
 
           echo ""
-          echo "=== 编译 OpenSSL ==="
-          make package/libs/openssl/compile -j$(nproc) V=s 2>&1 | tail -25 || \
-            echo "::warning::OpenSSL 编译失败"
+          echo "========== 开发文件检查 =========="
+          for item in \
+            "staging_dir/target-*/usr/include/openssl/opensslv.h|OpenSSL 头文件" \
+            "staging_dir/target-*/usr/lib/libssl.so|libssl.so" \
+            "staging_dir/target-*/usr/lib/libcrypto.so|libcrypto.so" \
+            "staging_dir/target-*/usr/include/nghttp2/nghttp2.h|nghttp2 头文件" \
+            "staging_dir/target-*/usr/lib/libnghttp2.so|libnghttp2.so" \
+            "staging_dir/target-*/usr/lib/libz.so|libz.so" \
+            "staging_dir/target-*/usr/lib/pkgconfig/libcurl.pc|libcurl.pc"
+          do
+            pattern="${item%%|*}"
+            label="${item##*|}"
+            if ls $pattern >/dev/null 2>&1; then
+              echo "  ✅ $label"
+            else
+              echo "  ❌ $label"
+            fi
+          done
 
           echo ""
-          echo "=== 编译 nghttp2 ==="
-          make package/feeds/packages/nghttp2/compile -j$(nproc) V=s 2>&1 | tail -25 || \
-            echo "::warning::nghttp2 编译失败"
-
-          echo ""
-          echo "=== 编译 zlib ==="
-          make package/libs/zlib/compile -j$(nproc) V=s 2>&1 | tail -15 || \
-            echo "::warning::zlib 编译失败"
-
-          echo ""
-          echo "--- 开发文件检查 ---"
-          echo "OpenSSL 头文件:"
-          ls staging_dir/target-*/usr/include/openssl/opensslv.h 2>/dev/null && echo "  ✅ 有" || echo "  ❌ 无"
-          echo "OpenSSL 库:"
-          ls staging_dir/target-*/usr/lib/libssl.so staging_dir/target-*/usr/lib/libcrypto.so 2>/dev/null || echo "  ❌ 无"
-          echo "nghttp2 头文件:"
-          ls staging_dir/target-*/usr/include/nghttp2/nghttp2.h 2>/dev/null && echo "  ✅ 有" || echo "  ❌ 无"
-          echo "nghttp2 库:"
-          ls staging_dir/target-*/usr/lib/libnghttp2.* 2>/dev/null || echo "  ❌ 无"
-          echo "zlib:"
-          ls staging_dir/target-*/usr/lib/libz.* 2>/dev/null || echo "  ❌ 无"
+          echo "========== 结果写入 summary =========="
+          {
+            echo "### firmware 模式依赖诊断"
+            echo ""
+            echo "| 文件 | 状态 |"
+            echo "|---|---|"
+            for item in \
+              "staging_dir/target-*/usr/include/openssl/opensslv.h|OpenSSL 头文件" \
+              "staging_dir/target-*/usr/lib/libssl.so|libssl.so" \
+              "staging_dir/target-*/usr/lib/libcrypto.so|libcrypto.so" \
+              "staging_dir/target-*/usr/include/nghttp2/nghttp2.h|nghttp2 头文件" \
+              "staging_dir/target-*/usr/lib/libnghttp2.so|libnghttp2.so" \
+              "staging_dir/target-*/usr/lib/libz.so|libz.so"
+            do
+              pattern="${item%%|*}"
+              label="${item##*|}"
+              if ls $pattern >/dev/null 2>&1; then
+                echo "| $label | ✅ |"
+              else
+                echo "| $label | ❌ |"
+              fi
+            done
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: 编译 libcurl
         id: libcurl
